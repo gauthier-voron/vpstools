@@ -1,0 +1,681 @@
+#!/bin/bash
+#
+# Copyright 2020 Gauthier Voron
+#
+# This file is part of VpsTools.
+#
+# VpsTools is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# VpsTools is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# VpsTools. If not, see <https://www.gnu.org/licenses/>.
+
+
+set -e
+
+
+PRGNAME='wpctl'
+VERSION='1.0.0'
+AUTHOR='Gauthier Voron'
+EMAIL='gauthier.voron@mnesic.fr'
+
+OPTION_CREATEDB=0
+OPTION_DBNAME=
+OPTION_DEBUG=0
+OPTION_DOMAIN=
+OPTION_PASSWORD=
+OPTION_REPLACE=0
+OPTION_USER=
+
+
+# Subroutine helpers ----------------------------------------------------------
+
+# Get the value of an option with a given name in a wordpress wp-config.php
+#
+# Arg 0 - The name of the option to get.
+# Arg 1 - The path to the wp-config.php file.
+# Print - The option value.
+#
+get_wp_config() {
+    local name="$1" ; shift
+    local path="$1" ; shift
+
+    perl -wnle 'if (/^\s*define\s*\(\s*["'"'"']'"${name}"'["'"'"']\s*,\s*["'"'"']([^"'"'"']*)["'"'"']\s*\)\s*;\s*$/) {
+                    print($1);
+                    exit (0);
+                }' "${path}"
+}
+
+# Set the value of the option with the given name in a wordpress wp-config.php
+#
+# Arg 0 - The name of the option to set.
+# Arg 1 - The value to assign to the option.
+# Arg 2 - The path to the wp-config.php file.
+#
+set_wp_config() {
+    local name="$1" ; shift
+    local value="$1" ; shift
+    local path="$1" ; shift
+
+    perl -i -wple 's|^(\s*define\s*\(\s*["'"'"']'"${name}"'["'"'"']\s*,\s*["'"'"'])[^"'"'"']*(["'"'"']\s*\)\s*;\s*)$|$1'"${value}"'$2|' "${path}"
+}
+
+
+# Get the value of the option with the given name in the wordpress database.
+#
+# Arg 0 - The name of the database to get the option from.
+# Arg 1 - The user to use for accessing the database.
+# Arg 2 - The password to give to access to the database.
+# Arg 3 - The name of the option to get.
+# Print - The option value.
+#
+get_wp_option() {
+    local dbname="$1" ; shift
+    local user="$1" ; shift
+    local password="$1" ; shift;
+    local opname="$1" ; shift
+
+    echo "SELECT option_value FROM wp_options WHERE option_name='${opname}';" \
+        | mysql -u "${user}" -p"${password}" "${dbname}" | tail -n1
+}
+
+# Set the value of the option with the given name in a given wordpress
+# database.
+#
+# Arg 0 - The name of the database to set the option to.
+# Arg 1 - The user to use for accessing the database.
+# Arg 2 - The password to give to access to the database.
+# Arg 3 - The name of the option to set.
+# Arg 4 - The value to assign to the option.
+#
+set_wp_option() {
+    local dbname="$1" ; shift
+    local user="$1" ; shift
+    local password="$1" ; shift
+    local opname="$1" ; shift
+    local opvalue="$1" ; shift
+
+    echo "UPDATE wp_options SET option_value='${opvalue}' WHERE option_name='${opname}';" | mysql -u "${user}" -p"${password}" "${dbname}"
+}
+
+
+# Create the specified database owned by the given user with given password.
+#
+# Arg 0 - The name of the database to create.
+# Arg 1 - The name of the user owning the new database.
+# arg 2 - The password the new user identifies with.
+#
+create_db() {
+    local dbname="$1" ; shift
+    local user="$1" ; shift
+    local password="$1" ; shift
+
+    (
+	echo "CREATE USER '${user}'@'localhost' IDENTIFIED BY '${password}';"
+	echo "CREATE DATABASE ${dbname};"
+	echo "GRANT ALL PRIVILEGES ON ${dbname}.* TO '${user}'@'localhost';"
+    ) | mysql -u root
+}
+
+# Delete the specified database and the given user.
+#
+# Arg 0 - The name of the database to delete.
+# Arg 1 - The name of the user to delete.
+#
+delete_db() {
+    local dbname="$1" ; shift
+    local user="$1" ; shift
+
+    (
+	echo "DROP USER '${user}'@'localhost';"
+	echo "DROP DATABASE ${dbname};"
+    ) | mysql -u root
+}
+
+
+# Create a tarball containing a wordpress instance. The tarball is a compressed
+# tarball (format .tar.gz).
+#
+# Arg 0 - The root path of the wordpress instance. This must be a directory
+#         that contain the file 'wp-config.php'.
+# Arg 1 - The destination file.
+#
+create_tarball() {
+    local source="$1" ; shift
+    local target="$1" ; shift
+    local source_wp_config source_db_name source_db_user source_db_password
+    local target_dist_dir
+
+    source_wp_config="${source}/wp-config.php"
+
+    if [ "x${OPTION_DBNAME}" = 'x' ] ; then
+	source_db_name="$(get_wp_config 'DB_NAME' "${source_wp_config}")"
+    else
+	source_db_name="${OPTION_DBNAME}"
+    fi
+
+    if [ "x${OPTION_USER}" = 'x' ] ; then
+	source_db_user="$(get_wp_config 'DB_USER' "${source_wp_config}")"
+    else
+	source_db_user="${OPTION_USER}"
+    fi
+
+    if [ "x${OPTION_PASSWORD}" = 'x' ] ; then
+	source_db_password="$(get_wp_config 'DB_PASSWORD' \
+            "${source_wp_config}")"
+    else
+	source_db_password="${OPTION_PASSWORD}"
+    fi
+
+    target_dist_dir="$(mktemp -d --suffix='.d' \
+        "transfer-wordpress.XXXXXXXXXX")"
+    remove_on_exit "${target_dist_dir}"
+
+    
+    mysqldump -u "${source_db_user}" -p"${source_db_password}" \
+        "${source_db_name}" > "${target_dist_dir}/database.sql"
+
+    if [ -e "${target}" ] ; then
+	rm "${target}"
+    fi
+
+    tar -czf "${target}" \
+        --transform='flags=r;s|^'"${source##*/}"'|content.d|' \
+        -C "${target_dist_dir}" "database.sql" \
+        -C "${source}/.." "${source##*/}"
+
+    pop_on_exit
+
+    return 0
+}
+
+# Delete a Wordpress instance at the given location and the associated
+# database.
+#
+# Arg 0 - The Wordpress instance directory.
+#
+delete_instance() {
+    local dir="$1" ; shift
+    local wp_config db_name db_user
+
+    wp_config="${dir}/wp-config.php"
+
+    if [ "x${OPTION_DBNAME}" = 'x' ] ; then
+	db_name="$(get_wp_config 'DB_NAME' "${wp_config}")"
+    else
+	db_name="${OPTION_DBNAME}"
+    fi
+
+    if [ "x${OPTION_USER}" = 'x' ] ; then
+	db_user="$(get_wp_config 'DB_USER' "${wp_config}")"
+    else
+	db_user="${OPTION_USER}"
+    fi
+
+    delete_db "${db_name}" "${db_user}"
+
+    rm -rf "${dir}"
+}
+
+# Install a Wordpress instance at a new location from the specified tarball.
+#
+# Arg 0 - The source tarball file.
+# Arg 1 - The destination Wordpress directory.
+#
+install_instance() {
+    local source="$1" ; shift
+    local target="$1" ; shift
+    local target_wp_config target_db_name target_db_user target_db_password
+    local target_domain home siteurl source_dist_dir
+
+    if [ "x${OPTION_DOMAIN}" = 'x' ] ; then
+	target_domain="${target##*/}"
+	siteurl="https://${target_domain}"
+	home="https://${target_domain}"
+    else
+	target_domain="${OPTION_DOMAIN}"
+	target_domain="${target_domain##*://}"
+	siteurl="${OPTION_DOMAIN}"
+	home="${OPTION_DOMAIN}"
+    fi
+
+    if [ "x${OPTION_DBNAME}" = 'x' ] ; then
+	target_db_name="$(echo "${target_domain}" | tr '.' '_')"
+    else
+	target_db_name="${OPTION_DBNAME}"
+    fi
+
+    if [ "x${OPTION_USER}" = 'x' ] ; then
+	target_db_user="${target_domain}"
+    else
+	target_db_user="${OPTION_USER}"
+    fi
+
+    if [ "x${OPTION_PASSWORD}" = 'x' ] ; then
+	target_db_password="${target_domain}"
+    else
+	target_db_password="${OPTION_PASSWORD}"
+    fi
+
+    if [ ${OPTION_CREATEDB} = 1 ] ; then
+	create_db "${target_db_name}" "${target_db_user}" \
+	    "${target_db_password}"
+    fi
+
+    source_dist_dir="$(mktemp -d --suffix='.d' \
+        "transfer-wordpress.XXXXXXXXXX")"
+
+    remove_on_exit "${source_dist_dir}"
+
+    if [ -e "${target}" ] ; then
+	rm -rf "${target}"
+    fi
+
+    (
+	cd "${source_dist_dir}"
+	tar -xzf "${source}"
+    )
+
+    mv "${source_dist_dir}/content.d" "${target}"
+
+    mysql -u "${target_db_user}" -p"${target_db_password}" \
+        "${target_db_name}" < "${source_dist_dir}/database.sql"
+
+    pop_on_exit
+
+    target_wp_config="${target}/wp-config.php"
+
+    set_wp_config 'DB_NAME' "${target_db_name}" "${target_wp_config}"
+    set_wp_config 'DB_USER' "${target_db_user}" "${target_wp_config}"
+    set_wp_config 'DB_PASSWORD' "${target_db_password}" "${target_wp_config}"
+
+    set_wp_option "${target_db_name}" "${target_db_user}" \
+        "${target_db_password}" 'siteurl' "${siteurl}"
+
+    set_wp_option "${target_db_name}" "${target_db_user}" \
+        "${target_db_password}" 'home' "${home}"
+}
+
+# Update a Wordpress instance at a given location with the specified tarball.
+#
+# Arg 0 - The source tarball file.
+# Arg 1 - The destination Wordpress directory.
+#
+update_instance() {
+    local source="$1" ; shift
+    local target="$1" ; shift
+    local target_wp_config target_db_name target_db_user target_db_password
+    local siteurl home source_dist_dir
+
+    target_wp_config="${target}/wp-config.php"
+
+    if [ "x${OPTION_DBNAME}" = 'x' ] ; then
+	target_db_name="$(get_wp_config 'DB_NAME' "${target_wp_config}")"
+    else
+	target_db_name="${OPTION_DBNAME}"
+    fi
+
+    if [ "x${OPTION_USER}" = 'x' ] ; then
+	target_db_user="$(get_wp_config 'DB_USER' "${target_wp_config}")"
+    else
+	target_db_user="${OPTION_USER}"
+    fi
+
+    if [ "x${OPTION_PASSWORD}" = 'x' ] ; then
+	target_db_password="$(get_wp_config 'DB_PASSWORD' \
+            "${target_wp_config}")"
+    else
+	target_db_password="${OPTION_PASSWORD}"
+    fi
+
+    if [ "x${OPTION_DOMAIN}" = 'x' ] ; then
+	siteurl="$(get_wp_option "${target_db_name}" "${target_db_user}" \
+            "${target_db_password}" 'siteurl')"
+	home="$(get_wp_option "${target_db_name}" "${target_db_user}" \
+            "${target_db_password}" 'home')"
+    else
+	siteurl="${OPTION_DOMAIN}"
+	home="${OPTION_DOMAIN}"
+    fi
+
+    source_dist_dir="$(mktemp -d --suffix='.d' \
+        "transfer-wordpress.XXXXXXXXXX")"
+
+    remove_on_exit "${source_dist_dir}"
+
+    rm -rf "${target}" || true
+
+    (
+	cd "${source_dist_dir}"
+	tar -xzf "${source}"
+    )
+
+    mv "${source_dist_dir}/content.d" "${target}"
+
+    mysql -u "${target_db_user}" -p"${target_db_password}" \
+        "${target_db_name}" < "${source_dist_dir}/database.sql"
+
+    pop_on_exit
+
+    set_wp_config 'DB_NAME' "${target_db_name}" "${target_wp_config}"
+    set_wp_config 'DB_USER' "${target_db_user}" "${target_wp_config}"
+    set_wp_config 'DB_PASSWORD' "${target_db_password}" "${target_wp_config}"
+
+    set_wp_option "${target_db_name}" "${target_db_user}" \
+        "${target_db_password}" 'siteurl' "${siteurl}"
+
+    set_wp_option "${target_db_name}" "${target_db_user}" \
+        "${target_db_password}" 'home' "${home}"
+}
+
+
+# Register a path to be remove on exit.
+#
+# Arg 0 - The path of the file or directory to remove.
+#
+remove_on_exit() {
+    local path="$1" ; shift
+    echo "${path}" >> "${__on_exit_list}"
+}
+
+# Remove the last registered to be removed path.
+# Pop this path from the stack of to remove paths.
+#
+pop_on_exit() {
+    path="$(tail -n 1 "${__on_exit_list}")"
+    rm -rf "${path}"
+
+    head -n -1 "${__on_exit_list}" > "${__on_exit_list}.tmp"
+    mv "${__on_exit_list}.tmp" "${__on_exit_list}"
+}
+
+# Path of the file containing the paths to remove on exit. 
+__on_exit_list="$(mktemp --suffix='.txt' "transfer-wordpress.XXXXXXXXXX")"
+
+# Called on exit of this program.
+# Remove the paths stored on the __on_exit_list as well as the list itself.
+#
+__on_exit() {
+    local path
+
+    while read path ; do
+	rm -rf "${path}"
+    done < "${__on_exit_list}"
+
+    rm "${__on_exit_list}"
+}
+
+trap __on_exit 'EXIT'
+
+
+# Print an error message and exit.
+#
+# Arg 0 - The error message to print.
+#
+fatal() {
+    echo "$0: $@" >&2
+    echo "Please type '$0 --help' for more information" >&2
+    exit 1
+}
+
+
+# Print the usage message on stdout.
+#
+# Print - The multiline usage message.
+#
+usage() {
+    cat <<EOF
+Usage: $0 install [options] <srcfile> <destdir>
+       $0 remove [option] <dir>
+       $0 save [options] <srcdir> <destfile>
+       $0 update [options] <srcfile> <destdir>
+
+Save, install, remove or update a Wordpress instance.
+The Wordpress instance contains the files forming the website as well as the
+associated database content.
+
+  install - Install the Wordpress tarball located at <srcfile> under the
+            specified location <destdir>. This program assumes that the last
+            component of <destdir> is the domain name of the new Wordpress.
+            The database to use is assumed to be the domain name with the '.'
+            replaced by '_', the user and password are the domain name.
+            These default behaviors can be modified by options.
+
+  remove  - Remove a Wordpress instance located at the given <dir>. Also remove
+            the associated user and database.
+
+  save    - Save a Wordpress content located under the given <srcdir> directory
+            inside a tarball located at <destfile>.
+
+  update  - Update the Wordpress content located at <destdir> by the content
+            saved in the <srcfile> tarball. The installed Wordpress keeps the
+            same database and domain names.
+
+Options:
+
+  -c, --createdb              Create the database to use in install.
+
+  -d, --dbname <str>          Fetch content from the database <str>.
+
+  -D, --debug                 Print everything that is happening on stderr.
+
+  -h, --help                  Print this message and exit.
+
+  -n, --domain <str>          Install or update the Wordpress to be accessed at
+                              the domain name <str>.
+
+  -p, --password <str>        Use the password <str> to access the database.
+
+  -r, --replace               Replace the <destfile> tarball if it already
+                              exists during a save operation.
+
+  -u, --user <str>            Use the username <str> to access the database.
+
+  -V, --version               Print version information and exit.
+EOF
+}
+
+# Print this program version infomation.
+#
+# Print - The multiline version message.
+#
+version() {
+    echo "${PRGNAME} ${VERSION}"
+    echo "${AUTHOR}"
+    echo "${EMAIL}"
+}
+
+
+# Subcommand main subroutines start here --------------------------------------
+
+install() {
+    local srcfile destdir
+
+    if [ $# -lt 1 ] ; then
+	fatal "missing srcfile operand"
+    elif [ $# -lt 2 ] ; then
+	fatal "missing destdir operand"
+    elif [ $# -gt 2 ] ; then
+	fatal "unknown operand '$3'"
+    fi
+
+    srcfile="$1" ; shift
+    destdir="$1" ; shift
+
+    if [ "x${srcfile}" = 'x' ] ; then
+	fatal "invalid srcfile operand '${srcfile}'"
+    fi
+
+    if [ "x${destdir}" = 'x' ] ; then
+	fatal "invalid destdir operand '${destdir}'"
+    fi
+
+    if [ -e "${destdir}" -a ${OPTION_REPLACE} = 0 ] ; then
+	fatal "install destdir '${destdir}' already exists"
+    fi
+
+    if [ "${srcfile:0:1}" != '/' ] ; then
+	srcfile="${PWD}/${srcfile}"
+    fi
+
+    if [ "${destdir:0:1}" != '/' ] ; then
+	destdir="${PWD}/${destdir}"
+    fi
+
+    install_instance "${srcfile}" "${destdir}"
+}
+
+remove() {
+    local dir
+
+    if [ $# -lt 1 ] ; then
+	fatal "missing dir operand"
+    elif [ $# -gt 1 ] ; then
+	fatal "unknown operand '$2'"
+    fi
+
+    dir="$1" ; shift
+
+    if [ "x${dir}" = 'x' \
+	 -o ! -d "${dir}" \
+	 -o ! -f "${dir}/wp-config.php" ] ; then
+	fatal "invalid dir operand '${dir}'"
+    fi
+
+    if [ "${dir:0:1}" != '/' ] ; then
+	dir="${PWD}/${dir}"
+    fi
+
+    delete_instance "${dir}"
+}
+
+save() {
+    local srcdir destfile
+
+    if [ $# -lt 1 ] ; then
+	fatal "missing srcdir operand"
+    elif [ $# -lt 2 ] ; then
+	fatal "missing destfile operand"
+    elif [ $# -gt 2 ] ; then
+	fatal "unknown operand '$3'"
+    fi
+
+    srcdir="$1" ; shift
+    destfile="$1" ; shift
+
+    if [ "x${srcdir}" = 'x' \
+	 -o ! -d "${srcdir}" \
+	 -o ! -f "${srcdir}/wp-config.php" ] ; then
+	fatal "invalid srcdir operand '${srcdir}'"
+    fi
+
+    if [ "x${destfile}" = 'x' ] ; then
+	fatal "invalid destfile operand '${destfile}'"
+    fi
+
+    if [ -e "${destfile}" -a ${OPTION_REPLACE} = 0 ] ; then
+	fatal "save destfile '${destfile}' already exists"
+    fi
+
+    if [ "${srcdir:0:1}" != '/' ] ; then
+	srcdir="${PWD}/${srcdir}"
+    fi
+
+    if [ "${destfile:0:1}" != '/' ] ; then
+	destfile="${PWD}/${destfile}"
+    fi
+
+    create_tarball "${srcdir}" "${destfile}"
+}
+
+update() {
+    local srcfile destdir
+
+    if [ $# -lt 1 ] ; then
+	fatal "missing srcfile operand"
+    elif [ $# -lt 2 ] ; then
+	fatal "missing destdir operand"
+    elif [ $# -gt 2 ] ; then
+	fatal "unknown operand '$3'"
+    fi
+
+    srcfile="$1" ; shift
+    destdir="$1" ; shift
+
+    if [ "x${srcfile}" = 'x' ] ; then
+	fatal "invalid srcfile operand '${srcfile}'"
+    fi
+
+    if [ "x${destdir}" = 'x' \
+	 -o ! -d "${destdir}" \
+	 -o ! -f "${destdir}/wp-config.php" ] ; then
+	fatal "invalid destdir operand '${destdir}'"
+    fi
+
+    if [ "${srcfile:0:1}" != '/' ] ; then
+	srcfile="${PWD}/${srcfile}"
+    fi
+
+    if [ "${destdir:0:1}" != '/' ] ; then
+	destdir="${PWD}/${destdir}"
+    fi
+
+    update_instance "${srcfile}" "${destdir}"
+}
+
+
+# Main script starts here -----------------------------------------------------
+
+shortopt="cd:Dhn:p:ru:V"
+longopt="createdb,dbname:,help,domain:,password:,replace,user:,version"
+eval set -- `getopt -q -n "$0" -o "$shortopt" -l "$longopt" -- "$@"`
+
+while true ; do
+    case "$1" in
+	-c|--createdb ) OPTION_CREATEDB=1    ; shift         ;;
+	-d|--dbname   ) OPTION_DBNAME="$2"   ; shift ; shift ;;
+	-D|--debug    ) OPTION_DEBUG=1       ; shift         ;;
+	-h|--help     ) usage ; exit 0       ; shift         ;;
+	-n|--domain   ) OPTION_DOMAIN="$2"   ; shift ; shift ;;
+	-p|--password ) OPTION_PASSWORD="$2" ; shift ; shift ;;
+	-r|--replace  ) OPTION_REPLACE=1     ; shift         ;;
+	-u|--user     ) OPTION_USER="$2"     ; shift ; shift ;;
+	-V|--version  ) version ; exit 0     ; shift         ;;
+	--            )                        shift ; break ;;
+    esac
+done
+
+if [ ${OPTION_DEBUG} = 1 ] ; then
+    set -x
+fi
+
+if [ $# -lt 1 ] ; then
+    fatal "missing operation argument"
+fi
+
+ARGUMENT_OPERATION="$1" ; shift
+
+case "${ARGUMENT_OPERATION}" in
+    'install')
+	install "$@"
+	;;
+    'remove')
+	remove "$@"
+	;;
+    'save')
+	save "$@"
+	;;
+    'update')
+	update "$@"
+        ;;
+    *)
+	fatal "invalid operation operand '${ARGUMENT_OPERATION}'"
+	;;
+esac
