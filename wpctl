@@ -656,6 +656,14 @@ if [ ${OPTION_DEBUG} = 1 ] ; then
     set -x
 fi
 
+if ! command -v perl > '/dev/null' 2> '/dev/null' ; then
+    fatal "cannot find 'perl' command"
+fi
+
+if ! command -v mysql > '/dev/null' 2> '/dev/null' ; then
+    fatal "cannot find 'mysql' command"
+fi
+
 if [ $# -lt 1 ] ; then
     fatal "missing operation argument"
 fi
